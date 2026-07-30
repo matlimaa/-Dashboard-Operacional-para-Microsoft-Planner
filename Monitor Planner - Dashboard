@@ -1,0 +1,2216 @@
+// ==UserScript==
+// @name         Monitor Planner - Dashboard
+// @namespace    planner.shared
+// @match        https://planner.cloud.microsoft/*
+// @grant        none
+// @version      12.0
+// ==/UserScript==
+
+
+(function() {
+    'use strict';
+
+    const STORAGE_KEYS = {
+        DADOS: 'planner_dados',
+        DADOS_VALIDOS: 'planner_dados_ultimo_valido',
+        IGNORADOS: 'planner_ignorados',
+        PRAZOS: 'planner_prazo_equipe',
+        DASH_ABERTO: 'planner_dashboard_aberto',
+        ZOOM: 'planner_dashboard_zoom'
+    };
+
+    const REFRESH_INTERVAL_MS = 5000; // Atualiza os dados a cada 30 segundos
+    const RELOAD_INTERVAL_MS = 1000 * 60 * 10;
+
+    let painelAberto = false;
+    let intervaloAtualizacao = null;
+    let intervaloReload = null;
+    let ultimoConteudo = '';
+    let ultimoConteudoEquipe = '';
+    let ultimoConteudoAgendados = '';
+  let paginaEquipe = 0;
+let paginaAgendados = 0;
+let intervaloPainelLateral = null;
+let listaPainelLateralAtual = [];
+let assinaturaPainelLateral = '';
+let paginaPrincipal = 0;
+let intervaloCarrosselPrincipal = null;
+let listaCardsPrincipaisAtual = [];
+let assinaturaCardsPrincipais = '';
+
+const detalhesNotasPorTicket = new Map();
+const prazosConcessionariaPorTicket = new Map();
+let varreduraNotasEmAndamento = false;
+let ultimaVarreduraNotas = 0;
+const INTERVALO_VARREDURA_NOTAS_MS = 60000;
+
+const LIMITE_PAINEL = 6;
+const LIMITE_CARDS_PRINCIPAIS = 9;
+const TEMPO_ROTACAO = 5000; // Intervalo entre movimentos do carrossel
+const DURACAO_ANIMACAO = 950; // Movimento mais suave
+    let ultimoDadoValido = localStorage.getItem(STORAGE_KEYS.DADOS_VALIDOS) || '';
+    let zoomDashboard = Number(localStorage.getItem(STORAGE_KEYS.ZOOM) || '1');
+    let telaDashboard = null;
+    let visibilityHandler = null;
+    let timeoutStatusAtualizacao = null;
+
+
+    // =====================================================
+    // COLETOR INTEGRADO
+    // =====================================================
+    const INTERVALO_COLETA_MS = 10000;
+    const INTERVALO_ESTABILIDADE_MS = 300;
+    const REPETICOES_ESTAVEIS = 3;
+
+    let intervaloColetaPlanner = null;
+    let coletaEmAndamento = false;
+    let ultimaCapturaBruta = '';
+
+    function limparTextoColetor(texto) {
+        return String(texto || '')
+            .replace(/[]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function capturarConteudoEstavel() {
+        return new Promise(resolve => {
+            let ultimaLeitura = '';
+            let repeticoes = 0;
+            let tentativas = 0;
+            const maxTentativas = 40;
+
+            const intervalo = setInterval(() => {
+                tentativas++;
+
+                const linhas = document.querySelectorAll('[role="row"]');
+                const capturaAtual = [...linhas]
+                    .map(linha => limparTextoColetor(linha.innerText))
+                    .filter(Boolean)
+                    .join('\n');
+
+                if (capturaAtual && capturaAtual === ultimaLeitura) {
+                    repeticoes++;
+                } else {
+                    repeticoes = 0;
+                    ultimaLeitura = capturaAtual;
+                }
+
+                if (repeticoes >= REPETICOES_ESTAVEIS || tentativas >= maxTentativas) {
+                    clearInterval(intervalo);
+                    resolve(ultimaLeitura);
+                }
+            }, INTERVALO_ESTABILIDADE_MS);
+        });
+    }
+
+    async function executarColetaPlanner(forcar = false) {
+        if (coletaEmAndamento) return;
+        coletaEmAndamento = true;
+
+        try {
+            const capturaAtual = await capturarConteudoEstavel();
+
+            if (!capturaAtual.trim()) {
+                console.log('[Monitor Planner] Sem dados válidos para coletar.');
+                return;
+            }
+
+            const possuiTickets = /RUIET-|Ticket#/i.test(capturaAtual);
+            if (!possuiTickets) {
+                console.log('[Monitor Planner] A captura não contém tickets reconhecidos.');
+                return;
+            }
+
+            const mudou = capturaAtual !== ultimaCapturaBruta;
+            if (!forcar && !mudou) return;
+
+            ultimaCapturaBruta = capturaAtual;
+            const bloco = `=== ${new Date().toLocaleString('pt-BR')} ===\n${capturaAtual}`;
+
+            localStorage.setItem(STORAGE_KEYS.DADOS, bloco);
+            localStorage.setItem(STORAGE_KEYS.DADOS_VALIDOS, bloco);
+            ultimoDadoValido = bloco;
+
+            console.log(
+                mudou
+                    ? '[Monitor Planner] ✅ Snapshot atualizado.'
+                    : '[Monitor Planner] ✅ Snapshot renovado.'
+            );
+
+            if (painelAberto) {
+                ultimoConteudo = '';
+                ultimoConteudoEquipe = '';
+                ultimoConteudoAgendados = '';
+                atualizarDashboard(true);
+            }
+        } catch (erro) {
+            console.error('[Monitor Planner] Erro durante a coleta:', erro);
+        } finally {
+            coletaEmAndamento = false;
+        }
+    }
+
+    function iniciarColetorPlanner() {
+        if (intervaloColetaPlanner) return;
+
+        executarColetaPlanner(true);
+        intervaloColetaPlanner = setInterval(() => {
+            executarColetaPlanner(false);
+        }, INTERVALO_COLETA_MS);
+    }
+
+    function garantirEstiloLoadingDashboard() {
+        if (document.getElementById('estilo-loading-dashboard')) return;
+
+        const estilo = document.createElement('style');
+        estilo.id = 'estilo-loading-dashboard';
+        estilo.textContent = `
+            @keyframes plannerLoadingGirar {
+                from { transform: rotate(0deg); }
+                to { transform: rotate(360deg); }
+            }
+
+            #statusAtualizacaoDashboard .spinner-dashboard {
+                width: 12px;
+                height: 12px;
+                border: 2px solid rgba(255,255,255,0.25);
+                border-top-color: #42a5f5;
+                border-radius: 50%;
+                animation: plannerLoadingGirar .75s linear infinite;
+                flex: 0 0 auto;
+                box-sizing: border-box;
+            }
+        `;
+
+        document.head.appendChild(estilo);
+    }
+
+    function definirStatusAtualizacao(texto, carregando = true, tipo = 'normal') {
+        const status = document.getElementById('statusAtualizacaoDashboard');
+        const textoEl = document.getElementById('statusAtualizacaoTexto');
+        const spinner = status?.querySelector('.spinner-dashboard');
+
+        if (!status || !textoEl || !spinner) return;
+
+        if (timeoutStatusAtualizacao) {
+            clearTimeout(timeoutStatusAtualizacao);
+            timeoutStatusAtualizacao = null;
+        }
+
+        textoEl.textContent = texto;
+        spinner.style.display = carregando ? 'block' : 'none';
+
+        const cores = {
+            normal: {
+                fundo: 'rgba(25,25,25,.94)',
+                borda: '#3f3f3f',
+                texto: '#e0e0e0'
+            },
+            sucesso: {
+                fundo: 'rgba(10,42,23,.95)',
+                borda: '#00c853',
+                texto: '#69f0ae'
+            },
+            erro: {
+                fundo: 'rgba(42,15,15,.96)',
+                borda: '#ff5252',
+                texto: '#ff8a80'
+            }
+        };
+
+        const cor = cores[tipo] || cores.normal;
+        status.style.background = cor.fundo;
+        status.style.borderColor = cor.borda;
+        textoEl.style.color = cor.texto;
+        status.style.opacity = '1';
+    }
+
+    function finalizarStatusAtualizacao() {
+        const horario = new Date().toLocaleTimeString('pt-BR', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        });
+
+        definirStatusAtualizacao(`Atualizado às ${horario}`, false, 'sucesso');
+
+        timeoutStatusAtualizacao = setTimeout(() => {
+            const status = document.getElementById('statusAtualizacaoDashboard');
+            if (status) status.style.opacity = '0.72';
+        }, 2500);
+    }
+
+
+    function validarConteudoPlannerDisponivel() {
+        const textoPagina = document.body?.innerText || '';
+        const possuiIdentificadorNaPagina = /RUIET-\d+|Ticket#\d+/i.test(textoPagina);
+        const possuiQuickNotes = document.querySelector('i[data-icon-name="QuickNote"]');
+        const possuiDadosColetados = /RUIET-|Ticket#/i.test(
+            `${localStorage.getItem(STORAGE_KEYS.DADOS) || ''}
+${localStorage.getItem(STORAGE_KEYS.DADOS_VALIDOS) || ''}`
+        );
+
+        if (!possuiIdentificadorNaPagina && !possuiQuickNotes && !possuiDadosColetados) {
+            definirStatusAtualizacao(
+                'Erro: conteúdo do Planner indisponível. Atualize a página (F5).',
+                false,
+                'erro'
+            );
+
+            console.error(
+                '[Monitor Planner] A página não possui conteúdo disponível para coletar, comparar ou atualizar.'
+            );
+
+            return false;
+        }
+
+        if (!possuiDadosColetados && !possuiIdentificadorNaPagina) {
+            definirStatusAtualizacao(
+                'Erro: nenhum ticket disponível para atualização.',
+                false,
+                'erro'
+            );
+
+            console.error(
+                '[Monitor Planner] Nenhum ticket foi encontrado na página ou nos dados coletados.'
+            );
+
+            return false;
+        }
+
+        return true;
+    }
+
+    function criarBotao() {
+        if (document.getElementById('btn-dashboard-planner')) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'btn-dashboard-planner';
+        btn.innerText = '📊 Dashboard';
+        btn.style = `
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 9999;
+            padding: 10px 15px;
+            background: #0078d4;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(0,0,0,.25);
+        `;
+        btn.onclick = abrirDashboard;
+        document.body.appendChild(btn);
+    }
+
+    function aplicarZoomDashboard() {
+        const layout = document.getElementById('layoutDashboard');
+        if (!layout) return;
+
+        layout.style.transform = `scale(${zoomDashboard})`;
+        layout.style.transformOrigin = 'top left';
+        layout.style.width = `${100 / zoomDashboard}%`;
+    }
+
+    function obterIgnorados() {
+        try {
+            return JSON.parse(localStorage.getItem(STORAGE_KEYS.IGNORADOS) || '[]');
+        } catch {
+            return [];
+        }
+    }
+
+    function salvarIgnorados(lista) {
+        localStorage.setItem(STORAGE_KEYS.IGNORADOS, JSON.stringify(lista));
+    }
+
+    function prazoIgnorado(ruiet) {
+        return obterIgnorados().includes(ruiet);
+    }
+
+    function adicionarIgnorado(ruiet) {
+        const ignorados = obterIgnorados();
+        if (!ignorados.includes(ruiet)) {
+            ignorados.push(ruiet);
+            salvarIgnorados(ignorados);
+        }
+    }
+
+    function removerIgnorado(ruiet) {
+        let ignorados = obterIgnorados();
+        ignorados = ignorados.filter(r => r !== ruiet);
+        salvarIgnorados(ignorados);
+    }
+
+    function obterPrazosEquipe() {
+        try {
+            return JSON.parse(localStorage.getItem(STORAGE_KEYS.PRAZOS) || '{}');
+        } catch {
+            return {};
+        }
+    }
+
+    function salvarPrazosEquipe(obj) {
+        localStorage.setItem(STORAGE_KEYS.PRAZOS, JSON.stringify(obj));
+    }
+
+    function definirPrazoEquipe(ruiet, valor) {
+        const dados = obterPrazosEquipe();
+        dados[ruiet] = valor;
+        salvarPrazosEquipe(dados);
+    }
+
+    function obterPrazoEquipe(ruiet) {
+        return obterPrazosEquipe()[ruiet] || '';
+    }
+
+    function removerPrazoEquipe(ruiet) {
+        const dados = obterPrazosEquipe();
+        delete dados[ruiet];
+        salvarPrazosEquipe(dados);
+    }
+
+    function escaparHtml(texto) {
+        return String(texto || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+
+    function formatarDuracao(minutos) {
+        const total = Math.max(0, Math.floor(Number(minutos) || 0));
+        const h = Math.floor(total / 60);
+        const m = total % 60;
+        return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    }
+
+    function obterDataChamado(dataHoraStr) {
+        if (!dataHoraStr) return null;
+
+        const agora = new Date();
+        const ano = agora.getFullYear();
+
+        let match = String(dataHoraStr).match(/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})/);
+        if (match) {
+            const [, dia, mes, hora, minuto] = match;
+            const data = new Date(
+                ano,
+                Number(mes) - 1,
+                Number(dia),
+                Number(hora),
+                Number(minuto)
+            );
+            return isNaN(data.getTime()) ? null : data;
+        }
+
+        match = String(dataHoraStr).match(/(\d{1,2}):(\d{2})/);
+        if (match) {
+            const [, hora, minuto] = match;
+            const data = new Date(
+                ano,
+                agora.getMonth(),
+                agora.getDate(),
+                Number(hora),
+                Number(minuto)
+            );
+
+            if (data > agora) {
+                data.setDate(data.getDate() - 1);
+            }
+
+            return isNaN(data.getTime()) ? null : data;
+        }
+
+        return null;
+    }
+
+    function obterDataPossivelFutura(dataHoraStr) {
+        if (!dataHoraStr) return null;
+
+        const agora = new Date();
+        const ano = agora.getFullYear();
+
+        let match = String(dataHoraStr).match(/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})/);
+        if (match) {
+            const [, dia, mes, hora, minuto] = match;
+            const data = new Date(
+                ano,
+                Number(mes) - 1,
+                Number(dia),
+                Number(hora),
+                Number(minuto)
+            );
+            return isNaN(data.getTime()) ? null : data;
+        }
+
+        match = String(dataHoraStr).match(/(\d{1,2}):(\d{2})/);
+        if (match) {
+            const [, hora, minuto] = match;
+            const data = new Date(
+                ano,
+                agora.getMonth(),
+                agora.getDate(),
+                Number(hora),
+                Number(minuto)
+            );
+            return isNaN(data.getTime()) ? null : data;
+        }
+
+        return null;
+    }
+
+    function estaAgendado(dataHoraStr) {
+        const data = obterDataPossivelFutura(dataHoraStr);
+        if (!data) return false;
+        return data > new Date();
+    }
+
+    function parseDuracaoPrazo(texto) {
+        const valor = String(texto || '').trim();
+        const match = valor.match(/^(\d{1,2}):(\d{2})$/);
+        if (!match) return null;
+
+        const [, horas, minutos] = match;
+        return {
+            horas: Number(horas),
+            minutos: Number(minutos)
+        };
+    }
+
+    function calcularPrazoFinal(dataHoraStr, duracaoTexto) {
+        const inicio = obterDataChamado(dataHoraStr);
+        const duracao = parseDuracaoPrazo(duracaoTexto);
+
+        if (!inicio || !duracao) return null;
+
+        const prazo = new Date(inicio);
+        prazo.setHours(prazo.getHours() + duracao.horas);
+        prazo.setMinutes(prazo.getMinutes() + duracao.minutos);
+
+        return prazo;
+    }
+
+    function formatarDataHoraPrazo(data) {
+        if (!(data instanceof Date) || isNaN(data.getTime())) return '';
+
+        const dia = String(data.getDate()).padStart(2, '0');
+        const mes = String(data.getMonth() + 1).padStart(2, '0');
+        const hora = String(data.getHours()).padStart(2, '0');
+        const minuto = String(data.getMinutes()).padStart(2, '0');
+
+        return `${dia}/${mes} ${hora}:${minuto}`;
+    }
+
+    function calcularStatusPrazo(dataHoraStr, duracaoTexto) {
+      if (duracaoTexto === 'INDEFINIDO') {
+    return {
+        prazoFinal: null,
+        prazoFinalTexto: 'INDEFINIDO',
+        statusTexto: 'Prazo indefinido'
+    };
+}
+        const prazoFinal = calcularPrazoFinal(dataHoraStr, duracaoTexto);
+        if (!prazoFinal) return null;
+
+        const agora = new Date();
+        const diffMin = Math.floor((prazoFinal - agora) / 60000);
+        const absMin = Math.abs(diffMin);
+
+        return {
+            prazoFinal,
+            prazoFinalTexto: formatarDataHoraPrazo(prazoFinal),
+            statusTexto: diffMin >= 0
+                ? `Prazo em ${formatarDuracao(absMin)}`
+                : `Estourado há ${formatarDuracao(absMin)}`
+        };
+    }
+
+    function calcularTempoInfo(dataHoraStr) {
+        if (!dataHoraStr) {
+            return { texto: '', minutosTotais: -1, cor: '#fff' };
+        }
+
+        if (estaAgendado(dataHoraStr)) {
+            return {
+                texto: 'Agendado',
+                minutosTotais: -1,
+                cor: '#42a5f5'
+            };
+        }
+
+        const data = obterDataChamado(dataHoraStr);
+        if (!data) {
+            return { texto: '', minutosTotais: -1, cor: '#fff' };
+        }
+
+        const agora = new Date();
+        let diff = Math.floor((agora - data) / 60000);
+        if (diff < 0) diff = 0;
+
+        const texto = formatarDuracao(diff);
+
+        let cor = '#00c853';
+        if (diff >= 60) cor = '#ff5252';
+        else if (diff >= 40) cor = '#ffd600';
+
+        return {
+            texto,
+            minutosTotais: diff,
+            cor
+        };
+    }
+
+    function limparPrazoExpiradoSeNecessario(ruiet, dataHoraStr) {
+        if (!ruiet) return false;
+
+        const ignorado = prazoIgnorado(ruiet);
+        const prazoEquipe = obterPrazoEquipe(ruiet);
+      if (prazoEquipe === 'INDEFINIDO') {
+    return false;
+}
+
+        if (!ignorado || !prazoEquipe) return false;
+
+        const statusPrazo = calcularStatusPrazo(dataHoraStr, prazoEquipe);
+        if (!statusPrazo || !statusPrazo.prazoFinal) return false;
+
+        if (statusPrazo.prazoFinal <= new Date()) {
+            removerIgnorado(ruiet);
+            removerPrazoEquipe(ruiet);
+            return true;
+        }
+
+        return false;
+    }
+
+    function processarPrazosExpirados(dados) {
+        const linhas = String(dados || '').split('\n');
+
+        linhas.forEach(l => {
+            if (!l.trim()) return;
+if (!/(RUIET-|Ticket#)/i.test(l)) return;
+
+            const c = extrairCamposLinha(l);
+            if (!c.ruiet || !c.dataHora) return;
+
+            limparPrazoExpiradoSeNecessario(c.ruiet, c.dataHora);
+        });
+    }
+
+    function abrirModalPrazo(dataHoraBase, callbackConfirmar) {
+        const overlay = document.createElement('div');
+        overlay.style = `
+            position: fixed;
+            top:0; left:0;
+            width:100%; height:100%;
+            background: rgba(0,0,0,0.6);
+            z-index:10002;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+        `;
+
+        const modal = document.createElement('div');
+        modal.style = `
+            background:#1b1b1b;
+            color:#fff;
+            padding:16px;
+            border-radius:10px;
+            width:320px;
+            border:1px solid #444;
+            font-family:Arial;
+            box-shadow: 0 10px 30px rgba(0,0,0,.45);
+        `;
+
+        modal.innerHTML = `
+            <div style="font-weight:bold; margin-bottom:10px;">
+                Definir prazo
+            </div>
+
+            <div style="font-size:12px; color:#aaa; margin-bottom:10px;">
+                Base: ${escaparHtml(dataHoraBase || '--:--')}
+            </div>
+
+            <div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;">
+                <button data-add="30">+30m</button>
+                <button data-add="60">+1h</button>
+                <button data-add="90">+1h30</button>
+                <button data-add="120">+2h</button>
+                <button data-indefinido="1">♾ Indefinido</button>
+            </div>
+
+            <div style="margin-bottom:10px;">
+                Manual (HH:MM)
+                <div style="display:flex; gap:6px; margin-top:4px;">
+                    <input id="hh" type="number" min="0" max="23" placeholder="HH" style="width:60px;">
+                    <span>:</span>
+                    <input id="mm" type="number" min="0" max="59" placeholder="MM" style="width:60px;">
+                </div>
+            </div>
+
+            <div style="display:flex; justify-content:flex-end; gap:8px;">
+                <button id="cancelar">Cancelar</button>
+                <button id="ok">OK</button>
+            </div>
+        `;
+
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+
+        let minutosSelecionados = null;
+
+        modal.querySelectorAll('button[data-add]').forEach(btn => {
+
+
+
+            btn.style.cssText = `
+                background:#2b2b2b;
+                color:#fff;
+                border:1px solid #555;
+                border-radius:6px;
+                padding:6px 10px;
+                cursor:pointer;
+            `;
+            btn.onclick = () => {
+                minutosSelecionados = Number(btn.dataset.add);
+                confirmar();
+            };
+        });
+      const btnIndefinido = modal.querySelector('button[data-indefinido]');
+
+if (btnIndefinido) {
+    btnIndefinido.style.cssText = `
+        background:#495057;
+        color:#fff;
+        border:1px solid #666;
+        border-radius:6px;
+        padding:6px 10px;
+        cursor:pointer;
+    `;
+
+    btnIndefinido.onclick = () => {
+        callbackConfirmar('INDEFINIDO');
+        overlay.remove();
+    };
+}
+
+        modal.querySelector('#cancelar').style.cssText = `
+            background:#2b2b2b;
+            color:#fff;
+            border:1px solid #555;
+            border-radius:6px;
+            padding:6px 10px;
+            cursor:pointer;
+        `;
+
+        modal.querySelector('#ok').style.cssText = `
+            background:#0078d4;
+            color:#fff;
+            border:1px solid #0078d4;
+            border-radius:6px;
+            padding:6px 10px;
+            cursor:pointer;
+        `;
+
+        function confirmar() {
+            let minutos = minutosSelecionados;
+
+            if (minutos === null) {
+                const hh = Number(modal.querySelector('#hh').value || 0);
+                const mm = Number(modal.querySelector('#mm').value || 0);
+
+                if (hh === 0 && mm === 0) {
+                    alert('Informe um valor válido');
+                    return;
+                }
+
+                minutos = (hh * 60) + mm;
+            }
+
+            callbackConfirmar(minutos);
+            overlay.remove();
+        }
+
+        modal.querySelector('#ok').onclick = confirmar;
+        modal.querySelector('#cancelar').onclick = () => overlay.remove();
+    }
+
+    function extrairCamposLinha(linha) {
+        linha = String(linha || '').replace(/^\d+\s+/, '').trim();
+
+        const statusMatch = linha.match(/^[^\w\d\s]+|^[✅⚠️🚗⌛✔️✖️🔴🟡🟢]+/);
+        const status = statusMatch ? statusMatch[0].trim() : '';
+        if (status) {
+            linha = linha.replace(status, '').trim();
+        }
+
+const ruiet = (
+    linha.match(/RUIET-\d+|-\s*Ticket#\d+|Ticket#\d+/i) || ['']
+)[0].replace(/^\-\s*/, '');
+
+        let dataHora = '';
+        const matchCompleto = linha.match(/(\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2})/);
+        const matchHora = linha.match(/(\d{1,2}:\d{2})/);
+
+        if (matchCompleto) dataHora = matchCompleto[0];
+        else if (matchHora) dataHora = matchHora[0];
+
+let resto = linha
+    .replace(/(\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2})/, '')
+    .replace(/(\d{1,2}:\d{2})/, '')
+    .replace(/(?:RUIET-\d+|-\s*Ticket#\d+|Ticket#\d+)/i, '')
+    .replace(/^\s*[-–—]+\s*/, '') // remove -, – ou —
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+        const bucketsMap = {
+            'AG. RFO': ['AG. RFO'],
+            'AG. Equipe': ['AG. Equipe'],
+            'AG. Concessionaria': ['AG. Concessionaria'],
+            'Afeta 100+': ['Afeta 100+'],
+            'Backbone': ['Backbone'],
+            'Rádio': ['Rádio'],
+            'Afeta 100-': ['Afeta 100-'],
+            'Afeta 1000+': ['Afeta 1000+'],
+            'Falha elétrica': ['Falha elétrica'],
+        };
+
+        const buckets = [];
+
+        for (const [nome, aliases] of Object.entries(bucketsMap)) {
+            for (const alias of aliases) {
+                const aliasEscapado = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const regex = new RegExp(`(^|\\s|\\b)${aliasEscapado}(\\b|\\s|$)`, 'i');
+
+                if (regex.test(resto)) {
+                    if (!buckets.includes(nome)) buckets.push(nome);
+                    resto = resto.replace(regex, ' ').replace(/\s{2,}/g, ' ').trim();
+                }
+            }
+        }
+
+        const redes = [
+            'Polo MOR', 'Polo RGT', 'Polo CE', 'Polo BHS', 'Polo SJM',
+            'Polo PSA', 'Polo MOC', 'Polo ITV', 'Polo TBS', 'Polo WBY',
+            'Polo SPR', 'Polo VGA', 'Polo SJV', 'Polo SOC', 'Polo SAL',
+            'Polo LRA', 'Polo RN/PB', 'Polo PGU', 'Polo AFN'
+        ];
+
+        let rede = '';
+        for (const r of redes) {
+            const regexRede = new RegExp(r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+            if (regexRede.test(resto)) {
+                rede = r;
+                resto = resto.replace(regexRede, '').replace(/\s{2,}/g, ' ').trim();
+                break;
+            }
+        }
+
+        const descricao = resto.trim();
+
+        return { status, dataHora, ruiet, descricao, buckets, rede };
+    }
+
+    function linhaEstaConcluida(linha) {
+        const texto = String(linha || '').trim();
+        if (!texto) return false;
+
+        // Sinalizações concluídas não devem permanecer em nenhum painel.
+        // Considera os ícones de conclusão e descrições textuais usuais.
+        return /^(?:✅|✔️?|☑️|✖️?)\s*/u.test(texto)
+            || /\b(?:CONCLU[IÍ]D[AO]|FINALIZAD[AO]|ENCERRAD[AO]|RESOLVID[AO])\b/i.test(texto);
+    }
+
+    function formatarLinhaHtml(linha, destacar = false) {
+        const c = extrairCamposLinha(linha);
+        if (!c.ruiet) return '';
+
+        limparPrazoExpiradoSeNecessario(c.ruiet, c.dataHora);
+
+        const ignorado = prazoIgnorado(c.ruiet);
+        const prazoEquipe = obterPrazoEquipe(c.ruiet);
+        const prazoAtivo = ignorado && !!prazoEquipe;
+        const statusPrazo = prazoAtivo
+            ? calcularStatusPrazo(c.dataHora, prazoEquipe)
+            : null;
+
+        const tempo = calcularTempoInfo(c.dataHora);
+        const ehAgEquipe = Array.isArray(c.buckets) && c.buckets.includes('AG. Equipe');
+
+        let estilo = `
+            border-radius: 8px;
+            padding: 5px 6px;
+            margin-bottom: 4px;
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+        `;
+
+        if (prazoAtivo) {
+
+    if (prazoEquipe === 'INDEFINIDO') {
+        estilo += `
+            background: #24182f;
+            border: 1px solid #9c27b0;
+            border-left: 4px solid #9c27b0;
+        `;
+    } else {
+        estilo += `
+            background: #2b2b2b;
+            border: 1px solid #6c757d;
+            border-left: 4px solid #adb5bd;
+        `;
+    }
+
+} else if (tempo.minutosTotais >= 60) {
+            estilo += `
+                background: #2a0f0f;
+                border: 1px solid #ff5252;
+                border-left: 4px solid #ff5252;
+            `;
+        } else if (tempo.minutosTotais >= 40) {
+            estilo += `
+                background: #2a240f;
+                border: 1px solid #ffd600;
+                border-left: 4px solid #ffd600;
+            `;
+        } else {
+            estilo += `
+                background: #0f2a17;
+                border: 1px solid #00c853;
+                border-left: 4px solid #00c853;
+            `;
+        }
+
+        if (ehAgEquipe) {
+            estilo += `
+                box-shadow: 0 0 0 1px rgba(0,188,212,0.35), 0 0 10px rgba(0,188,212,0.15);
+            `;
+        }
+
+        if (destacar && !prazoAtivo) {
+            estilo += ' box-shadow: 0 0 10px rgba(255,82,82,0.3);';
+        }
+
+        let textoDireita = tempo.texto;
+
+        if (prazoAtivo) {
+            textoDireita += statusPrazo
+                ? ` • ${statusPrazo.statusTexto}`
+                : ' • SEGUIR SLA';
+        }
+
+        return `
+<div class="planner-card" style="${estilo}">
+    <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-start; gap:2px;">
+        <div style="display:flex; flex-wrap:wrap; align-items:center; gap:6px; min-width:0;">
+            <strong style="font-size:15px; color:#ffffff; min-width:0; overflow:hidden; text-overflow:ellipsis; word-break:break-word;">
+                ${escaparHtml(c.ruiet)}
+            </strong>
+            ${ehAgEquipe ? `<span style="font-size:12px; color:#00bcd4; font-weight:bold;">AG. EQUIPE</span>` : ''}
+        </div>
+
+        <span style="color:${
+    prazoAtivo
+        ? (prazoEquipe === 'INDEFINIDO' ? '#9c27b0' : '#adb5bd')
+        : tempo.cor
+}; font-weight:bold; font-size:16px; white-space:nowrap; flex-shrink:0;">
+            ${escaparHtml(textoDireita)}
+        </span>
+    </div>
+
+    <div style="font-size:11px; color:#e0e0e0; margin-top:2px; word-break:break-word;">
+        ${escaparHtml(c.descricao || 'Sem descrição')}
+    </div>
+
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:-3px; gap:8px;">
+        <div style="font-size:12px; color:#9e9e9e; word-break:break-word; font-weight:bold;">
+            ${escaparHtml(c.status)} ${escaparHtml(c.dataHora)}
+            ${Array.isArray(c.buckets) && c.buckets.length
+                ? ` | <strong style="color:#ffffff;">${c.buckets.map(b =>
+                    b === 'AG. Equipe'
+                        ? `<span style="color:#00bcd4;">${escaparHtml(b)}</span>`
+                        : escaparHtml(b)
+                  ).join(' | ')}</strong>`
+                : ''}
+            ${c.rede ? ` | ${escaparHtml(c.rede)}` : ''}
+            ${statusPrazo ? ` | PRAZO ${escaparHtml(statusPrazo.prazoFinalTexto)}` : ''}
+        </div>
+
+        <button class="toggle-ignorado" data-ruiet="${escaparHtml(c.ruiet)}" style="
+            background: ${prazoAtivo ? '#495057' : '#2b2b2b'};
+            color: #fff;
+            border: 1px solid #666;
+            border-radius: 6px;
+            padding: 3px 7px;
+            font-size: 11px;
+            cursor: pointer;
+            flex-shrink:0;
+        ">
+            ${prazoAtivo ? '⌛' : '🚗'}
+        </button>
+    </div>
+</div>
+        `;
+    }
+
+
+function normalizarIdentificadorTicket(valor) {
+    return String(valor || '')
+        .replace(/^\-\s*/, '')
+        .trim()
+        .toUpperCase();
+}
+
+function extrairDetalhesNota(texto) {
+    const conteudo = String(texto || '');
+
+    // Somente a linha "Concessionaria: HH:MM" alimenta os cards laterais.
+    // Linhas genéricas como "Prazo:" ou "SLA:" não entram nessa seção.
+    const horarioConcessionaria =
+        conteudo.match(/concession[aá]ria\s*:\s*(\d{1,2}:\d{2})(?=\s*(?:;|$|\n|\r))/im)?.[1]?.trim() || '';
+
+    return {
+        texto: conteudo,
+        horarioConcessionaria
+    };
+}
+
+function localizarIdentificadorNoElemento(elemento) {
+    if (!elemento) return '';
+
+    const candidatos = [
+        elemento.closest('[role="row"]'),
+        elemento.closest('[data-automationid]'),
+        elemento.closest('li'),
+        elemento.closest('tr'),
+        elemento.parentElement
+    ].filter(Boolean);
+
+    for (const candidato of candidatos) {
+        const texto = candidato.innerText || candidato.textContent || '';
+        const match = texto.match(/RUIET-\d+|Ticket#\d+/i);
+        if (match) return normalizarIdentificadorTicket(match[0]);
+    }
+
+    return '';
+}
+
+async function atualizarDetalhesNotasPlanner(forcar = false) {
+    const agora = Date.now();
+
+    if (varreduraNotasEmAndamento) return;
+    if (!forcar && agora - ultimaVarreduraNotas < INTERVALO_VARREDURA_NOTAS_MS) return;
+
+    const icones = [...document.querySelectorAll('i[data-icon-name="QuickNote"]')];
+    if (!icones.length) {
+        if (painelAberto) {
+            definirStatusAtualizacao(
+                'Erro: Quick Notes indisponíveis. Atualize a página (F5).',
+                false,
+                'erro'
+            );
+        }
+
+        console.error(
+            '[Monitor Planner] Nenhuma Quick Note foi encontrada na página.'
+        );
+
+        return;
+    }
+
+    definirStatusAtualizacao('Lendo Quick Notes...', true, 'normal');
+
+    varreduraNotasEmAndamento = true;
+    ultimaVarreduraNotas = agora;
+
+    try {
+        let houveAlteracao = false;
+        const identificadoresEncontrados = new Set();
+
+        for (let indiceNota = 0; indiceNota < icones.length; indiceNota++) {
+            const icone = icones[indiceNota];
+            let identificador = localizarIdentificadorNoElemento(icone);
+
+            const botao = icone.closest('button');
+            if (!botao) continue;
+
+            botao.click();
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            const editor = document.querySelector('.notes-editor');
+            const texto = editor?.innerText || editor?.textContent || '';
+
+            if (!identificador) {
+                const encontradoNaNota = texto.match(/RUIET-\d+|Ticket#\d+/i);
+                identificador = encontradoNaNota
+                    ? normalizarIdentificadorTicket(encontradoNaNota[0])
+                    : `NOTA ${indiceNota + 1}`;
+            }
+
+            identificador = normalizarIdentificadorTicket(identificador);
+            identificadoresEncontrados.add(identificador);
+
+            const detalhes = extrairDetalhesNota(texto);
+
+            // A nota completa fica independente do prazo da concessionária.
+            const anterior = detalhesNotasPorTicket.get(identificador);
+            if (!anterior || anterior.texto !== texto) {
+                detalhesNotasPorTicket.set(identificador, { texto });
+                houveAlteracao = true;
+            }
+
+            // Somente notas com "Concessionaria: HH:MM" entram nos cards laterais.
+            const horarioAnterior = prazosConcessionariaPorTicket.get(identificador) || '';
+            if (detalhes.horarioConcessionaria) {
+                if (horarioAnterior !== detalhes.horarioConcessionaria) {
+                    prazosConcessionariaPorTicket.set(
+                        identificador,
+                        detalhes.horarioConcessionaria
+                    );
+                    houveAlteracao = true;
+                }
+            } else if (prazosConcessionariaPorTicket.delete(identificador)) {
+                houveAlteracao = true;
+            }
+        }
+
+        // Remove registros antigos quando o nome/identificador do ticket foi alterado.
+        // Isso evita manter simultaneamente o identificador anterior e o novo.
+        for (const identificadorSalvo of [...detalhesNotasPorTicket.keys()]) {
+            if (!identificadoresEncontrados.has(identificadorSalvo)) {
+                detalhesNotasPorTicket.delete(identificadorSalvo);
+                prazosConcessionariaPorTicket.delete(identificadorSalvo);
+                houveAlteracao = true;
+            }
+        }
+
+        for (const identificadorSalvo of [...prazosConcessionariaPorTicket.keys()]) {
+            if (!identificadoresEncontrados.has(identificadorSalvo)) {
+                prazosConcessionariaPorTicket.delete(identificadorSalvo);
+                houveAlteracao = true;
+            }
+        }
+
+        if (houveAlteracao && painelAberto) {
+            assinaturaPainelLateral = '';
+            atualizarDashboard(true);
+        }
+    } catch (erro) {
+        console.warn('Não foi possível ler todas as notas do Planner:', erro);
+        definirStatusAtualizacao('Erro ao ler Quick Notes', false, 'erro');
+    } finally {
+        varreduraNotasEmAndamento = false;
+
+        const statusTexto =
+            document.getElementById('statusAtualizacaoTexto')?.textContent || '';
+
+        if (!/Erro/i.test(statusTexto)) {
+            finalizarStatusAtualizacao();
+        }
+    }
+}
+
+
+function obterPrimeiroStatusConfirmadoNota(texto) {
+    const linhas = String(texto || '').split(/\r?\n/);
+
+    for (const linha of linhas) {
+        const linhaLimpa = linha.trim();
+
+        // Usa exatamente o primeiro status ✅ na ordem em que aparece na nota.
+        if (!linhaLimpa.startsWith('✅')) continue;
+
+        const dataHora = linhaLimpa.match(
+            /(\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2})/
+        );
+
+        if (dataHora) return dataHora[1];
+    }
+
+    return '';
+}
+
+function formatarTimerConcessionaria(segundosTotais) {
+    const total = Math.max(0, Math.floor(Number(segundosTotais) || 0));
+    const horas = Math.floor(total / 3600);
+    const minutos = Math.floor((total % 3600) / 60);
+    const segundos = total % 60;
+
+    if (horas > 0) {
+        return `${horas}h ${String(minutos).padStart(2, '0')}m ${String(segundos).padStart(2, '0')}s`;
+    }
+
+    return `${minutos}m ${String(segundos).padStart(2, '0')}s`;
+}
+
+function obterTimerConcessionaria(horarioTexto) {
+    const match = String(horarioTexto || '').trim().match(/^(\d{1,2}):(\d{2})$/);
+    if (!match) return null;
+
+    const horas = Number(match[1]);
+    const minutos = Number(match[2]);
+
+    if (horas > 23 || minutos > 59) return null;
+
+    const agora = new Date();
+    const prazoFinal = new Date(
+        agora.getFullYear(),
+        agora.getMonth(),
+        agora.getDate(),
+        horas,
+        minutos,
+        0,
+        0
+    );
+
+    const diferencaSegundos = Math.floor((prazoFinal.getTime() - agora.getTime()) / 1000);
+    const vencido = diferencaSegundos < 0;
+
+    return {
+        prazoFinal,
+        vencido,
+        texto: vencido
+            ? `ESTOURADO HÁ ${formatarTimerConcessionaria(Math.abs(diferencaSegundos))}`
+            : `FALTAM ${formatarTimerConcessionaria(diferencaSegundos)}`
+    };
+}
+
+function gerarCardsPrazoConcessionaria() {
+    const itens = [];
+
+    // Exibe somente tickets cuja Quick Note contenha a palavra
+    // "Concessionaria" ou "Concessionária", mesmo quando não houver horário.
+    const dadosPlanner = (
+        localStorage.getItem(STORAGE_KEYS.DADOS) ||
+        localStorage.getItem(STORAGE_KEYS.DADOS_VALIDOS) ||
+        ultimoDadoValido ||
+        ''
+    );
+
+    const ticketsAtuais = new Map();
+
+    String(dadosPlanner).split('\n').forEach(linha => {
+        if (!linha.trim()) return;
+        if (!/(RUIET-|Ticket#)/i.test(linha)) return;
+        if (linhaEstaConcluida(linha)) return;
+
+        const campos = extrairCamposLinha(linha);
+        if (!campos.ruiet) return;
+
+        const identificador = normalizarIdentificadorTicket(campos.ruiet);
+        if (!identificador) return;
+
+        ticketsAtuais.set(identificador, {
+            identificador,
+            polo: campos.rede || 'Polo não informado'
+        });
+    });
+
+    for (const ticket of ticketsAtuais.values()) {
+        const detalhesNota = detalhesNotasPorTicket.get(ticket.identificador);
+        const textoNota = String(detalhesNota?.texto || '');
+
+        // Sem a palavra Concessionaria na descrição/Quick Note, não entra na lateral.
+        if (!/concession[aá]ria/i.test(textoNota)) continue;
+
+        const horario = String(
+            prazosConcessionariaPorTicket.get(ticket.identificador) || ''
+        ).trim();
+
+        const timer = horario ? obterTimerConcessionaria(horario) : null;
+        const possuiPrazoValido = !!timer;
+
+        const fundo = possuiPrazoValido
+            ? (timer.vencido ? '#2a0f0f' : '#0f2a17')
+            : '#242424';
+        const borda = possuiPrazoValido
+            ? (timer.vencido ? '#ff5252' : '#00c853')
+            : '#757575';
+        const corPrazo = possuiPrazoValido
+            ? (timer.vencido ? '#ff5252' : '#69f0ae')
+            : '#bdbdbd';
+        const textoPrazo = possuiPrazoValido ? horario : 'NÃO INFORMADO';
+
+        itens.push({
+            identificador: ticket.identificador,
+            prazo: horario,
+            possuiPrazo: possuiPrazoValido,
+            html: `
+<div class="card-prazo-concessionaria" style="
+background:${fundo};
+border-left:4px solid ${borda};
+border-radius:8px;
+padding:6px 8px;
+margin-bottom:4px;">
+<div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">
+<strong style="color:#fff;font-size:12px;overflow-wrap:anywhere;">${escaparHtml(ticket.identificador)}</strong>
+<span style="color:${corPrazo};font-weight:bold;white-space:nowrap;font-size:11px;">${escaparHtml(textoPrazo)}</span>
+</div>
+<div style="margin-top:4px;font-size:11px;font-weight:bold;color:#42a5f5;">
+${escaparHtml(ticket.polo)}
+</div>
+</div>`
+        });
+    }
+
+    // Primeiro os tickets sem prazo; depois, os horários mais próximos.
+    itens.sort((a, b) => {
+        if (a.possuiPrazo !== b.possuiPrazo) return a.possuiPrazo ? 1 : -1;
+        if (!a.possuiPrazo && !b.possuiPrazo) {
+            return a.identificador.localeCompare(b.identificador, 'pt-BR');
+        }
+
+        const timerA = obterTimerConcessionaria(a.prazo);
+        const timerB = obterTimerConcessionaria(b.prazo);
+        return (timerA?.prazoFinal?.getTime() || 0) - (timerB?.prazoFinal?.getTime() || 0);
+    });
+
+    return itens;
+}
+
+function obterDetalhesNotaTicket(identificador) {
+    return detalhesNotasPorTicket.get(
+        normalizarIdentificadorTicket(identificador)
+    ) || null;
+}
+
+function gerarPainelLateral(dados) {
+        const linhas = String(dados || '').split('\n');
+        const itens = [];
+        const agora = new Date();
+
+        linhas.forEach(linha => {
+            if (!linha.trim()) return;
+            if (!/(RUIET-|Ticket#)/i.test(linha)) return;
+            if (linhaEstaConcluida(linha)) return;
+
+            const c = extrairCamposLinha(linha);
+            if (!c.ruiet) return;
+
+            const ehEquipe =
+                Array.isArray(c.buckets) &&
+                c.buckets.includes('AG. Equipe');
+
+            const ehAgendado = estaAgendado(c.dataHora);
+            if (!ehEquipe && !ehAgendado) return;
+
+            // Horário futuro sempre pertence à seção Agendados.
+            // AG. Equipe recebe apenas os itens do bucket que não estão agendados.
+            const tipo = ehAgendado ? 'Agendado' : 'AG. Equipe';
+            const dataReferencia = ehAgendado
+                ? obterDataPossivelFutura(c.dataHora)
+                : obterDataChamado(c.dataHora);
+
+            let minutosOrdenacao = 0;
+            let timerTexto = '';
+            let timerCor = '#ffffff';
+
+            if (tipo === 'AG. Equipe') {
+                const tempo = calcularTempoInfo(c.dataHora);
+                minutosOrdenacao = Math.max(0, tempo.minutosTotais || 0);
+                timerTexto = tempo.texto ? `ATRASO ${tempo.texto}` : 'SEM HORÁRIO';
+                timerCor = tempo.cor || '#ffffff';
+            } else if (dataReferencia) {
+                const minutosRestantes = Math.max(
+                    0,
+                    Math.ceil((dataReferencia.getTime() - agora.getTime()) / 60000)
+                );
+                minutosOrdenacao = minutosRestantes;
+                timerTexto = `EM ${formatarDuracao(minutosRestantes)}`;
+                timerCor = '#42a5f5';
+            }
+
+            const detalhesNota = obterDetalhesNotaTicket(c.ruiet);
+            const concessionariaNota = detalhesNota?.concessionaria || '';
+            const prazoNota = detalhesNota?.prazo || '';
+
+            itens.push({
+                tipo,
+                prioridade: tipo === 'AG. Equipe' ? 0 : 1,
+                minutosOrdenacao,
+                html: `
+<div class="card-carrossel-lateral" style="
+    box-sizing:border-box;
+    background:${tipo === 'AG. Equipe' ? '#101820' : '#0d1b2a'};
+    border-left:4px solid ${tipo === 'AG. Equipe' ? '#00bcd4' : '#42a5f5'};
+    border-radius:8px;
+    padding:4px 6px;
+    margin-bottom:3px;
+    line-height:1.05;
+">
+    <div style="
+        display:grid;
+        grid-template-columns:minmax(0, 1fr) auto;
+        align-items:start;
+        column-gap:10px;
+        row-gap:2px;
+    ">
+<strong style="
+    color:#fff;
+    font-size:12px;
+    font-weight:bold;
+    min-width:0;
+    line-height:1.05;
+    overflow-wrap:anywhere;
+    word-break:break-word;
+">${escaparHtml(c.ruiet)}</strong>
+
+        <span style="
+            color:${timerCor};
+            font-size:11px;
+            font-weight:bold;
+            line-height:1.05;
+            text-align:right;
+            white-space:normal;
+            overflow-wrap:anywhere;
+            max-width:120px;
+        ">${escaparHtml(timerTexto)}</span>
+    </div>
+    <div style="font-size:12px;color:#999;margin-top:2px;line-height:1.15;overflow-wrap:anywhere;word-break:break-word;">
+        ${escaparHtml(c.dataHora || '')}
+        ${c.rede ? ` | ${escaparHtml(c.rede)}` : ''}
+    </div>
+
+</div>`
+            });
+        });
+
+        itens.sort((a, b) => {
+            if (a.prioridade !== b.prioridade) {
+                return a.prioridade - b.prioridade;
+            }
+
+            // Equipe: maior atraso primeiro. Agendados: horário mais próximo primeiro.
+            if (a.tipo === 'AG. Equipe') {
+                return b.minutosOrdenacao - a.minutosOrdenacao;
+            }
+
+            return a.minutosOrdenacao - b.minutosOrdenacao;
+        });
+
+        return itens;
+    }
+
+
+    function gerarListaCardsPrincipais(dados) {
+        const linhas = String(dados || '').split('\n');
+        const itens = [];
+
+        linhas.forEach(l => {
+            if (!l.trim()) return;
+            if (l.includes('===')) return;
+            if (!/(RUIET-|Ticket#)/i.test(l)) return;
+            if (linhaEstaConcluida(l)) return;
+
+            let dh = '';
+            const matchCompleto = l.match(/(\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2})/);
+            const matchHora = l.match(/(\d{1,2}:\d{2})/);
+
+            if (matchCompleto) dh = matchCompleto[0];
+            else if (matchHora) dh = matchHora[0];
+            else return;
+
+            const c = extrairCamposLinha(l);
+            if (!c.ruiet) return;
+            if (estaAgendado(c.dataHora)) return;
+
+            const ehAgEquipe = Array.isArray(c.buckets) && c.buckets.includes('AG. Equipe');
+            if (ehAgEquipe) return;
+
+            limparPrazoExpiradoSeNecessario(c.ruiet, c.dataHora);
+
+            const t = calcularTempoInfo(dh);
+            itens.push({
+                linha: l,
+                atraso: t.minutosTotais,
+                prazoAtivo: prazoIgnorado(c.ruiet) && !!obterPrazoEquipe(c.ruiet)
+            });
+        });
+
+        itens.sort((a, b) => {
+            const prazoA = obterPrazoEquipe(extrairCamposLinha(a.linha).ruiet);
+            const prazoB = obterPrazoEquipe(extrairCamposLinha(b.linha).ruiet);
+
+            // INDEFINIDO sempre por último.
+            if (prazoA === 'INDEFINIDO' && prazoB !== 'INDEFINIDO') return 1;
+            if (prazoA !== 'INDEFINIDO' && prazoB === 'INDEFINIDO') return -1;
+
+            const atrasoA = isNaN(a.atraso) ? 0 : a.atraso;
+            const atrasoB = isNaN(b.atraso) ? 0 : b.atraso;
+
+            if (a.prazoAtivo !== b.prazoAtivo) {
+                return a.prazoAtivo ? 1 : -1;
+            }
+
+            return atrasoB - atrasoA;
+        });
+
+        return itens;
+    }
+
+    function renderizarPaginaPrincipal() {
+        const conteudoEl = document.getElementById('conteudo');
+        if (!conteudoEl) return;
+
+        if (!listaCardsPrincipaisAtual.length) {
+            conteudoEl.innerHTML = `
+<div style="
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    height:60vh;
+    color:#888;
+    font-size:16px;
+    text-align:center;
+    opacity:0.8;
+">
+    Sem atualizações no momento
+</div>`;
+            return;
+        }
+
+        const duasColunas = listaCardsPrincipaisAtual.length > LIMITE_CARDS_PRINCIPAIS;
+        const colunaEsquerda = duasColunas
+            ? listaCardsPrincipaisAtual.slice(0, LIMITE_CARDS_PRINCIPAIS)
+            : listaCardsPrincipaisAtual;
+        const colunaDireita = duasColunas
+            ? listaCardsPrincipaisAtual.slice(LIMITE_CARDS_PRINCIPAIS)
+            : [];
+
+        conteudoEl.innerHTML = `
+            <section style="
+                background:#181818;
+                border:1px solid #3b3b3b;
+                border-radius:10px;
+                padding:7px;
+                box-sizing:border-box;
+                width:100%;
+            ">
+                <div style="
+                    display:flex;
+                    justify-content:space-between;
+                    align-items:center;
+                    color:#e0e0e0;
+                    font-weight:bold;
+                    font-size:12px;
+                    margin:0 2px 7px;
+                    padding-bottom:6px;
+                    border-bottom:1px solid rgba(224,224,224,0.25);
+                ">
+                    <span>⚡ EVENTO EM ANDAMENTO</span>
+                    <span style="color:#8d8d8d;font-size:11px;">${listaCardsPrincipaisAtual.length} cards</span>
+                </div>
+
+                <div id="conteudoCardsPrincipal" style="
+                    display:grid;
+                    grid-template-columns:${duasColunas ? 'minmax(0, 1fr) minmax(0, 1fr)' : 'minmax(0, 1fr)'};
+                    column-gap:10px;
+                    align-items:start;
+                    width:100%;
+                ">
+                    <div style="min-width:0;">
+                        ${colunaEsquerda.map((item, indice) =>
+                            formatarLinhaHtml(item.linha, indice === 0)
+                        ).join('')}
+                    </div>
+
+                    ${duasColunas ? `
+                    <div style="min-width:0;">
+                        ${colunaDireita.map(item =>
+                            formatarLinhaHtml(item.linha, false)
+                        ).join('')}
+                    </div>` : ''}
+                </div>
+            </section>`;
+
+        aplicarZoomDashboard();
+        vincularEventosBotoes();
+    }
+
+    function garantirRotacaoCarrosselPrincipal() {
+        if (intervaloCarrosselPrincipal) return;
+
+        intervaloCarrosselPrincipal = setInterval(() => {
+            if (!painelAberto || !document.getElementById('carrosselPrincipal')) return;
+            girarCarrosselVertical('carrosselPrincipal');
+        }, TEMPO_ROTACAO);
+    }
+
+    function obterDadosSeguros() {
+        const dadosAtuais = (localStorage.getItem(STORAGE_KEYS.DADOS) || '').trim();
+
+        if (/(RUIET-|Ticket#)/i.test(dadosAtuais)) {
+            ultimoDadoValido = dadosAtuais;
+            localStorage.setItem(STORAGE_KEYS.DADOS_VALIDOS, dadosAtuais);
+            return dadosAtuais;
+        }
+
+        // Se a coleta atual vier vazia, mantém o último conteúdo válido no painel principal.
+        const dadosSalvos = (
+            ultimoDadoValido ||
+            localStorage.getItem(STORAGE_KEYS.DADOS_VALIDOS) ||
+            ''
+        ).trim();
+
+        return /(RUIET-|Ticket#)/i.test(dadosSalvos) ? dadosSalvos : '';
+    }
+
+    function vincularEventosBotoes() {
+        document.querySelectorAll('.toggle-ignorado').forEach(btn => {
+            btn.onclick = (e) => {
+                e.stopPropagation();
+
+                const ruiet = btn.getAttribute('data-ruiet');
+
+                if (prazoIgnorado(ruiet)) {
+                    removerIgnorado(ruiet);
+                    removerPrazoEquipe(ruiet);
+                    ultimoConteudo = '';
+                    ultimoConteudoEquipe = '';
+                    ultimoConteudoAgendados = '';
+                    atualizarDashboard(true);
+                    return;
+                }
+
+                const card = btn.closest('.planner-card');
+                const linhaTexto = card ? card.innerText : '';
+                const c = extrairCamposLinha(linhaTexto);
+
+ abrirModalPrazo(c.dataHora, (valor) => {
+
+    adicionarIgnorado(ruiet);
+
+    if (valor === 'INDEFINIDO') {
+        definirPrazoEquipe(ruiet, 'INDEFINIDO');
+    } else {
+        const horas = Math.floor(valor / 60);
+        const mins = valor % 60;
+
+        const valorFormatado =
+            `${String(horas).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
+
+        definirPrazoEquipe(ruiet, valorFormatado);
+    }
+
+    ultimoConteudo = '';
+    ultimoConteudoEquipe = '';
+    ultimoConteudoAgendados = '';
+    atualizarDashboard(true);
+});
+            };
+        });
+    }
+
+    function ajustarAlturaViewport(viewport) {
+        if (!viewport) return;
+
+        const limite = Number(viewport.dataset.limite || 3);
+        const lista = viewport.querySelector('.lista-carrossel-lateral');
+        if (!lista) return;
+
+        const cards = Array.from(lista.children);
+        if (!cards.length) {
+            viewport.style.height = '0px';
+            return;
+        }
+
+        // Remove alturas anteriores para medir o conteúdo real.
+        cards.forEach(card => {
+            card.style.height = 'auto';
+            card.style.minHeight = '0';
+        });
+
+        // Todos os cards da mesma seção recebem a altura do maior card.
+        // Assim, o card que entra por baixo nunca fica parcialmente cortado.
+        const maiorAlturaConteudo = Math.max(
+            ...cards.map(card => Math.ceil(card.getBoundingClientRect().height))
+        );
+
+        cards.forEach(card => {
+            card.style.height = `${maiorAlturaConteudo}px`;
+            card.style.minHeight = `${maiorAlturaConteudo}px`;
+            card.style.overflow = 'visible';
+        });
+
+        const primeiro = cards[0];
+        const estilo = getComputedStyle(primeiro);
+        const alturaExterna = maiorAlturaConteudo
+            + parseFloat(estilo.marginTop || 0)
+            + parseFloat(estilo.marginBottom || 0);
+
+        const quantidadeVisivel = Math.min(limite, cards.length);
+        viewport.style.height = `${Math.ceil(alturaExterna * quantidadeVisivel + 6)}px`;
+    }
+
+    function ajustarTodosViewports() {
+        document.querySelectorAll('.viewport-carrossel-lateral')
+            .forEach(ajustarAlturaViewport);
+    }
+
+
+    function montarSecaoPrazoConcessionariaFixa(itens) {
+        const conteudo = itens.length
+            ? itens.map(item => item.html).join('')
+            : `
+<div style="
+    padding:8px;
+    color:#8d8d8d;
+    font-size:11px;
+    text-align:center;
+">
+    Nenhum ticket com Concessionaria na descrição
+</div>`;
+
+        return `
+<section style="
+    margin-bottom:10px;
+    background:#181818;
+    border:1px solid #3a2a14;
+    border-radius:9px;
+    padding:6px;
+    box-sizing:border-box;
+">
+    <div style="
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        color:#ff9800;
+        font-weight:bold;
+        font-size:11px;
+        margin:0 2px 5px;
+        padding-bottom:5px;
+        border-bottom:1px solid rgba(255,152,0,0.35);
+    ">
+        <span>🏢 PRAZO CONCESSIONÁRIA (${itens.length})</span>
+    </div>
+
+    <div style="
+        overflow:visible;
+        padding-right:1px;
+    ">
+        ${conteudo}
+    </div>
+</section>`;
+    }
+
+    function renderizarPaginaPainelLateral() {
+        const painel = document.getElementById('painelLateralUnificado');
+        const colunaLateral = document.getElementById('colunaLateral');
+
+        if (!painel || !colunaLateral) return;
+
+        const equipe = listaPainelLateralAtual.filter(item => item.tipo === 'AG. Equipe');
+        const agendados = listaPainelLateralAtual.filter(item => item.tipo === 'Agendado');
+        const prazosConcessionaria = gerarCardsPrazoConcessionaria();
+
+        const possuiPainelUnificado = equipe.length > 0 || agendados.length > 0;
+
+        // Prazo Concessionária permanece sempre visível.
+        // O painel unificado aparece somente quando houver AG. Equipe ou Agendados.
+        colunaLateral.style.display = 'flex';
+
+        const ambasAtivas = equipe.length > 0 && agendados.length > 0;
+        const limiteEquipe = ambasAtivas ? 4 : LIMITE_PAINEL;
+        const limiteAgendados = ambasAtivas ? 4 : LIMITE_PAINEL;
+
+        const montarSecao = (id, titulo, icone, cor, itens, limite) => {
+            if (!itens.length) return '';
+
+            return `
+                <section style="margin-bottom:10px;">
+                    <div style="
+                        display:flex;
+                        justify-content:space-between;
+                        align-items:center;
+                        color:${cor};
+                        font-weight:bold;
+                        font-size:11px;
+                        margin:0 2px 4px;
+                        padding-bottom:5px;
+                        border-bottom:1px solid ${cor}55;
+                    ">
+                        <span>${icone} ${titulo} (${itens.length})</span>
+                        ${itens.length > limite ? '<span style="font-size:12px;color:#999;">∞</span>' : ''}
+                    </div>
+
+                    <div class="viewport-carrossel-lateral" data-limite="${limite}" style="
+                        position:relative;
+                        overflow:hidden;
+                        transition:height 250ms ease-in-out;
+                        padding-bottom:1px;
+                        box-sizing:border-box;
+                    ">
+                        <div id="${id}" class="lista-carrossel-lateral" style="
+                            transform:translate3d(0, 0, 0);
+                            will-change:transform;
+                            backface-visibility:hidden;
+                            -webkit-backface-visibility:hidden;
+                            transform-style:preserve-3d;
+                            contain:layout;
+                        ">
+                            ${itens.map(item => item.html).join('')}
+                        </div>
+                    </div>
+                </section>`;
+        };
+
+        const painelConcessionaria = document.getElementById('painelConcessionaria');
+
+        if (painelConcessionaria) {
+            painelConcessionaria.style.display = 'block';
+            painelConcessionaria.innerHTML = montarSecaoPrazoConcessionariaFixa(
+                prazosConcessionaria
+            );
+        }
+
+        painel.style.display = possuiPainelUnificado ? 'block' : 'none';
+        painel.innerHTML = possuiPainelUnificado ? `
+            ${montarSecao('carrosselEquipe', 'AG. EQUIPE', '👥', '#00bcd4', equipe, limiteEquipe)}
+            ${montarSecao('carrosselAgendados', 'AGENDADOS', '📅', '#42a5f5', agendados, limiteAgendados)}
+        ` : '';
+
+        requestAnimationFrame(ajustarTodosViewports);
+    }
+
+    function girarCarrosselVertical(id) {
+        const lista = document.getElementById(id);
+        if (!lista || lista.dataset.animando === '1') return;
+
+        const viewport = lista.closest('.viewport-carrossel-lateral');
+        const limite = Number(viewport?.dataset.limite || 3);
+        const cards = lista.children;
+
+        // Só gira quando existem cards além da quantidade visível.
+        if (cards.length <= limite) return;
+
+        const primeiro = cards[0];
+        const estilo = getComputedStyle(primeiro);
+        const deslocamento = primeiro.getBoundingClientRect().height
+            + parseFloat(estilo.marginTop || 0)
+            + parseFloat(estilo.marginBottom || 0);
+
+        if (!deslocamento) return;
+
+        lista.dataset.animando = '1';
+        lista.style.transition = 'none';
+        lista.style.transform = 'translate3d(0, 0, 0)';
+
+        let finalizado = false;
+
+        const finalizar = () => {
+            if (finalizado) return;
+            finalizado = true;
+
+            lista.removeEventListener('transitionend', aoFinalizarTransicao);
+
+            // Reposiciona o card fora da animação para manter o loop contínuo.
+            lista.appendChild(primeiro);
+            lista.style.transition = 'none';
+            lista.style.transform = 'translate3d(0, 0, 0)';
+            lista.dataset.animando = '0';
+
+            requestAnimationFrame(() => ajustarAlturaViewport(viewport));
+        };
+
+        const aoFinalizarTransicao = (evento) => {
+            if (evento.target === lista && evento.propertyName === 'transform') {
+                finalizar();
+            }
+        };
+
+        lista.addEventListener('transitionend', aoFinalizarTransicao);
+
+        // Dois frames garantem que o navegador prepare a camada antes de mover.
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                lista.style.transition =
+                    `transform ${DURACAO_ANIMACAO}ms cubic-bezier(0.22, 0.61, 0.36, 1)`;
+                lista.style.transform = `translate3d(0, -${deslocamento}px, 0)`;
+            });
+        });
+
+        // Segurança para navegadores que não disparem transitionend.
+        setTimeout(finalizar, DURACAO_ANIMACAO + 250);
+    }
+
+    function garantirRotacaoPainelLateral() {
+        if (intervaloPainelLateral) return;
+
+        intervaloPainelLateral = setInterval(() => {
+            if (!painelAberto || !document.getElementById('painelLateralUnificado')) return;
+
+            girarCarrosselVertical('carrosselEquipe');
+            girarCarrosselVertical('carrosselAgendados');
+        }, TEMPO_ROTACAO);
+    }
+
+    function atualizarDashboard(forcar = false) {
+        const conteudoEl = document.getElementById('conteudo');
+        if (!conteudoEl) return;
+
+        if (!validarConteudoPlannerDisponivel()) {
+            return;
+        }
+
+        definirStatusAtualizacao('Coletando tickets...', true, 'normal');
+
+        const dados = obterDadosSeguros();
+
+        definirStatusAtualizacao('Processando prazos...', true, 'normal');
+        processarPrazosExpirados(dados);
+
+        // Remove imediatamente dos mapas laterais qualquer ticket que não esteja
+        // mais ativo nos dados atuais ou que já esteja marcado como concluído.
+        const identificadoresAtivos = new Set();
+        String(dados || '').split('\n').forEach(linha => {
+            if (!/(RUIET-|Ticket#)/i.test(linha)) return;
+            if (linhaEstaConcluida(linha)) return;
+
+            const campos = extrairCamposLinha(linha);
+            if (campos.ruiet) {
+                identificadoresAtivos.add(normalizarIdentificadorTicket(campos.ruiet));
+            }
+        });
+
+        if (identificadoresAtivos.size || /RUIET-|Ticket#/i.test(String(dados || ''))) {
+            for (const identificador of [...detalhesNotasPorTicket.keys()]) {
+                if (!identificadoresAtivos.has(normalizarIdentificadorTicket(identificador))) {
+                    detalhesNotasPorTicket.delete(identificador);
+                    prazosConcessionariaPorTicket.delete(identificador);
+                    removerIgnorado(identificador);
+                    removerPrazoEquipe(identificador);
+                }
+            }
+
+            for (const identificador of [...prazosConcessionariaPorTicket.keys()]) {
+                if (!identificadoresAtivos.has(normalizarIdentificadorTicket(identificador))) {
+                    prazosConcessionariaPorTicket.delete(identificador);
+                }
+            }
+        }
+
+        // A leitura das notas ocorre em paralelo e atualiza os cards ao terminar.
+        atualizarDetalhesNotasPlanner(false);
+
+        const novaListaPrincipal = dados
+            ? gerarListaCardsPrincipais(dados)
+            : [];
+
+        const novaAssinaturaPrincipal = novaListaPrincipal
+            .map(item => {
+                const ruiet = extrairCamposLinha(item.linha).ruiet;
+                return `${item.linha}|${item.prazoAtivo}|${obterPrazoEquipe(ruiet)}`;
+            })
+            .join('\n');
+
+        if (forcar || novaAssinaturaPrincipal !== assinaturaCardsPrincipais) {
+            listaCardsPrincipaisAtual = novaListaPrincipal;
+            assinaturaCardsPrincipais = novaAssinaturaPrincipal;
+
+            // Só reconstrói os cards quando os dados realmente mudarem.
+            // A rotação do carrossel apenas movimenta os elementos existentes,
+            // preservando cores, ícones, prazos e a posição da sequência.
+            renderizarPaginaPrincipal();
+        }
+
+        const novaLista = gerarPainelLateral(dados);
+        const novaAssinatura = novaLista
+            .map(item => `${item.tipo}|${item.html}`)
+            .join('\n');
+
+        if (forcar || novaAssinatura !== assinaturaPainelLateral) {
+            definirStatusAtualizacao('Atualizando dashboard...', true, 'normal');
+
+            listaPainelLateralAtual = novaLista;
+            assinaturaPainelLateral = novaAssinatura;
+
+            renderizarPaginaPainelLateral();
+        }
+
+        garantirRotacaoPainelLateral();
+        garantirRotacaoCarrosselPrincipal();
+
+        if (!varreduraNotasEmAndamento) {
+            finalizarStatusAtualizacao();
+        }
+    }
+
+    function iniciarReloadInteligente() {
+        if (intervaloReload) clearInterval(intervaloReload);
+
+        intervaloReload = setInterval(() => {
+            if (document.hidden) {
+                console.log('🔄 Recarregando página em segundo plano...');
+                location.reload();
+            }
+        }, RELOAD_INTERVAL_MS);
+    }
+
+    function fecharDashboard() {
+        if (intervaloAtualizacao) {
+            clearInterval(intervaloAtualizacao);
+            intervaloAtualizacao = null;
+        }
+
+        if (intervaloPainelLateral) {
+            clearInterval(intervaloPainelLateral);
+            intervaloPainelLateral = null;
+        }
+
+        if (intervaloCarrosselPrincipal) {
+            clearInterval(intervaloCarrosselPrincipal);
+            intervaloCarrosselPrincipal = null;
+        }
+
+        if (timeoutStatusAtualizacao) {
+            clearTimeout(timeoutStatusAtualizacao);
+            timeoutStatusAtualizacao = null;
+        }
+        paginaEquipe = 0;
+        paginaAgendados = 0;
+        listaPainelLateralAtual = [];
+        assinaturaPainelLateral = '';
+        paginaPrincipal = 0;
+        listaCardsPrincipaisAtual = [];
+        assinaturaCardsPrincipais = '';
+
+        if (visibilityHandler) {
+            document.removeEventListener('visibilitychange', visibilityHandler);
+            visibilityHandler = null;
+        }
+
+        if (telaDashboard) {
+            telaDashboard.remove();
+            telaDashboard = null;
+        }
+
+        painelAberto = false;
+        ultimoConteudo = '';
+        ultimoConteudoEquipe = '';
+        ultimoConteudoAgendados = '';
+        localStorage.removeItem(STORAGE_KEYS.DASH_ABERTO);
+    }
+
+    function abrirDashboard() {
+        if (painelAberto) return;
+        painelAberto = true;
+        localStorage.setItem(STORAGE_KEYS.DASH_ABERTO, '1');
+
+        garantirEstiloLoadingDashboard();
+
+        const tela = document.createElement('div');
+        telaDashboard = tela;
+        tela.style = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #121212;
+            color: #ffffff;
+            overflow-y: auto;
+            overflow-x: hidden;
+            z-index: 10000;
+            padding: 15px;
+            font-family: Arial, sans-serif;
+            box-sizing: border-box;
+        `;
+
+        tela.innerHTML = `
+<button id="fechar" style="
+    position: fixed;
+    top: 12px;
+    right: 18px;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.05);
+    color: #aaa;
+    border: 1px solid rgba(255,255,255,0.1);
+    font-size: 16px;
+    cursor: pointer;
+    opacity: 0;
+    transition: 0.3s ease;
+    backdrop-filter: blur(6px);
+">✕</button>
+
+<div id="controleZoom" style="
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    z-index: 10001;
+    display: flex;
+    gap: 6px;
+    opacity: 0;
+    transition: 0.3s ease;
+">
+    <button id="zoomMenos" style="
+        background: rgba(255,255,255,0.05);
+        color: #aaa;
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 6px;
+        padding: 4px 8px;
+        cursor: pointer;
+        backdrop-filter: blur(6px);
+    ">A-</button>
+
+    <button id="zoomMais" style="
+        background: rgba(255,255,255,0.05);
+        color: #aaa;
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 6px;
+        padding: 4px 8px;
+        cursor: pointer;
+        backdrop-filter: blur(6px);
+    ">A+</button>
+</div>
+
+<div id="statusAtualizacaoDashboard" style="
+    position:fixed;
+    bottom:12px;
+    right:60px;
+    z-index:10003;
+    display:flex;
+    align-items:center;
+    gap:7px;
+    min-height:30px;
+    padding:5px 10px;
+    box-sizing:border-box;
+    background:rgba(25,25,25,.94);
+    border:1px solid #3f3f3f;
+    border-radius:8px;
+    box-shadow:0 4px 16px rgba(0,0,0,.35);
+    backdrop-filter:blur(6px);
+    font-size:11px;
+    font-weight:bold;
+    transition:opacity .25s ease, background .25s ease, border-color .25s ease;
+">
+    <span class="spinner-dashboard"></span>
+    <span id="statusAtualizacaoTexto" style="color:#e0e0e0;">Iniciando...</span>
+</div>
+
+<div id="layoutDashboard" style="
+    display:flex;
+    gap:12px;
+    margin-top:8px;
+    width:100%;
+    max-width:100%;
+    box-sizing:border-box;
+    align-items:flex-start;
+">
+    <div id="colunaPrincipal" style="
+        flex:1;
+        min-width:0;
+        box-sizing:border-box;
+        overflow:hidden;
+    ">
+        <div id="conteudo" style="
+            width:100%;
+            max-width:100%;
+            box-sizing:border-box;
+        "></div>
+    </div>
+
+ <div id="colunaLateral" style="
+    width:250px;
+    min-width:250px;
+    max-width:250px;
+    flex:0 0 250px;
+    display:none;
+    flex-direction:column;
+    gap:10px;
+">
+
+    <div id="painelConcessionaria" style="
+        width:100%;
+        background:#181818;
+        border:1px solid #5b3a08;
+        border-radius:10px;
+        padding:6px;
+        box-sizing:border-box;
+        overflow:visible;
+        flex:0 0 auto;
+    "></div>
+
+    <div id="painelLateralUnificado" style="
+        width:100%;
+        background:#181818;
+        border:1px solid #2e2e2e;
+        border-radius:10px;
+        padding:6px;
+        box-sizing:border-box;
+        flex:1;
+        overflow-y:auto;
+        overflow-x:hidden;
+    "></div>
+</div>
+
+   `;
+
+        document.body.appendChild(tela);
+
+        document.getElementById('zoomMais').onclick = () => {
+            zoomDashboard = Math.min(1.5, Number((zoomDashboard + 0.1).toFixed(1)));
+            localStorage.setItem(STORAGE_KEYS.ZOOM, zoomDashboard.toFixed(1));
+            aplicarZoomDashboard();
+        };
+
+        document.getElementById('zoomMenos').onclick = () => {
+            zoomDashboard = Math.max(0.7, Number((zoomDashboard - 0.1).toFixed(1)));
+            localStorage.setItem(STORAGE_KEYS.ZOOM, zoomDashboard.toFixed(1));
+            aplicarZoomDashboard();
+        };
+
+        tela.onmousemove = (e) => {
+            const btnFechar = document.getElementById('fechar');
+            const controleZoom = document.getElementById('controleZoom');
+
+            if (btnFechar) {
+                if (e.clientY < 60 && e.clientX > window.innerWidth - 80) {
+                    btnFechar.style.opacity = '1';
+                } else {
+                    btnFechar.style.opacity = '0';
+                }
+            }
+
+            if (controleZoom) {
+                if (e.clientY < 60 && e.clientX < 120) {
+                    controleZoom.style.opacity = '1';
+                } else {
+                    controleZoom.style.opacity = '0';
+                }
+            }
+        };
+
+        visibilityHandler = () => {
+            if (!document.hidden) {
+                setTimeout(() => atualizarDashboard(true), 500);
+            }
+        };
+        document.addEventListener('visibilitychange', visibilityHandler);
+
+        intervaloAtualizacao = setInterval(() => {
+            atualizarDashboard(false);
+        }, REFRESH_INTERVAL_MS);
+
+        atualizarDashboard(true);
+        setTimeout(() => atualizarDetalhesNotasPlanner(true), 800);
+
+        document.getElementById('fechar').onclick = fecharDashboard;
+    }
+
+    window.addEventListener('load', () => {
+        criarBotao();
+        iniciarReloadInteligente();
+        iniciarColetorPlanner();
+
+        if (localStorage.getItem(STORAGE_KEYS.DASH_ABERTO) === '1') {
+            setTimeout(() => {
+                abrirDashboard();
+            }, 1500);
+        }
+    });
+})();
