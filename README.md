@@ -1,4 +1,4 @@
-# Dashboard Operacional para Microsoft Planner
+Dashboard Operacional para Microsoft Planner
 
 Aplicação web desenvolvida para auxiliar o acompanhamento de eventos operacionais em ambiente de Telecom.
 
